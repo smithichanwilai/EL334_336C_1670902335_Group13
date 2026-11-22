@@ -1,0 +1,421 @@
+#include <MK64F12.h>
+
+// =========================================================================
+// 1. MACROS: 7-SEGMENT DISPLAY PATTERNS (COMMON ANODE / ACTIVE-LOW)
+// =========================================================================
+// Bit order: [DP, G, F, E, D, C, B, A] -> 0 = LED ON, 1 = LED OFF
+// Example: 'L' turns on segments F, E, D -> Binary 1100 0111 = 0xC7
+#define SEG_L   0xC7  // 'L' (Segments D, E, F ON)
+#define SEG_O   0xC0  // 'O' (Segments A, B, C, D, E, F ON)
+#define SEG_C   0xC6  // 'C' (Segments A, D, E, F ON)
+#define SEG_E   0x86  // 'E' (Segments A, D, E, F, G ON)
+#define SEG_P   0x8C  // 'P' (Segments A, B, E, F, G ON)
+#define SEG_n   0xC8  // 'n' (Segments C, E, G ON - lowercase style)
+#define SEG_r   0xAF  // 'r' (Segments E, G ON)
+#define SEG_A   0x88  // 'A' (Segments A, B, C, E, F, G ON)
+#define SEG_OFF 0xFF  // All segments OFF (Binary 1111 1111)
+
+// Number patterns for password entry (Active-Low)
+#define SEG_1   0xF9  // '1' (Segments B, C ON)
+#define SEG_2   0xA4  // '2' (Segments A, B, D, E, G ON)
+#define SEG_3   0xB0  // '3' (Segments A, B, C, D, G ON)
+
+// =========================================================================
+// 2. MACROS: SERVO MOTOR PWM DUTY CYCLE CALCULATION (50Hz / 20ms PERIOD)
+// =========================================================================
+// System Core Clock (Default FEI Mode on FRDM-K64F) = 20.97152 MHz (20,971,520 Hz)
+// FTM0 Prescaler = 128 (FTM_SC_PS = 7, since 2^7 = 128)
+// FTM0 Tick Frequency = 20,971,520 / 128 = 163,840 Hz (163.84 ticks per 1 ms)
+// Target PWM Frequency for MG90S Servo = 50 Hz (Period = 1 / 50 = 20 ms)
+// Modulo Value (FTM0->MOD) = 163,840 / 50 = 3276.8 -> 3276 ticks
+//
+// Pulse Width Calculation (CnV = 163.84 ticks/ms * Pulse Width in ms):
+// - 0 Degrees   (1.0 ms pulse / 5% Duty)  = 163.84 * 1.0 = 163.84 -> 164
+// - 90 Degrees  (1.5 ms pulse / 7.5% Duty)= 163.84 * 1.5 = 245.76 -> 246
+// - 180 Degrees (2.0 ms pulse / 10% Duty) = 163.84 * 2.0 = 327.68 -> 328
+// (Note: Can be fine-tuned slightly lower e.g. 320-324 if gears hit mechanical stop)
+#define FTM_SERVO_MOD 3276 // 20 ms period (50 Hz)
+#define SERVO_LOCK    164  // ~1.0 ms pulse -> 0 Degrees (Locked position)
+#define SERVO_UNLOCK  328  // ~2.0 ms pulse -> 180 Degrees (Unlocked position)
+
+// =========================================================================
+// 3. MACROS: SOFTWARE TIMING CONSTANTS (BASED ON 2ms SYSTICK HEARTBEAT)
+// =========================================================================
+// Formula: Ticks = Desired Time (ms) / SysTick Interval (2 ms)
+#define DEBOUNCE_TICKS   100  // 200 ms (0.2s) / 2 ms = 100 ticks (Switch debounce filter)
+#define PENALTY_TICKS    1500 // 3000 ms (3.0s) / 2 ms = 1500 ticks (Wrong password lockout)
+#define AUTOLOCK_TICKS   1500 // 3000 ms (3.0s) / 2 ms = 1500 ticks (Auto-lock delay)
+
+// =========================================================================
+// 4. GLOBAL VARIABLES (volatile used because they are shared with ISRs)
+// =========================================================================
+// Digit selector bitmasks for 74HC595 shift register (Digits 1 to 4 from left to right)
+const uint8_t DIGIT_SELECT[4] = { 0xF1, 0xF2, 0xF4, 0xF8 };
+volatile uint8_t display_buffer[4] = {SEG_L, SEG_O, SEG_C, SEG_OFF}; // Default: "LOC "
+volatile uint8_t current_digit = 0; // Tracks currently lit digit (0..3)
+
+// System State Flags & Countdown Timers
+volatile uint8_t safe_unlocked = 0;    // 0 = Locked, 1 = Unlocked
+volatile uint8_t alarm_triggered = 0;  // 0 = Normal, 1 = Intrusion Alarm active
+volatile uint32_t debounce_timer = 0;  // Decrements every 2ms in SysTick_Handler
+volatile uint32_t error_timer = 0;     // Decrements every 2ms in SysTick_Handler
+volatile uint32_t auto_lock_timer = 0; // Decrements every 2ms in SysTick_Handler
+
+// Password Buffer Logic (Fixed 4-digit passcode: 1 - 3 - 2 - 3)
+const uint8_t correct_password[4] = {1, 3, 2, 3};
+volatile uint8_t input_buffer[4]  = {0}; // Stores user inputs until all 4 digits are entered
+volatile uint8_t input_count = 0;        // Counts entered digits (0..4)
+
+// =========================================================================
+// 5. AUDIO SEQUENCER MODULE (NON-BLOCKING BUZZER CONTROL)
+// =========================================================================
+// Array format (1 tick = 2 ms):
+//   Positive value (+N) = Buzzer ON for N * 2 ms
+//   Negative value (-N) = Buzzer OFF (silence) for N * 2 ms
+//   Zero (0)            = End of audio sequence
+const int16_t snd_key[]     = {15, 0};                    // 30ms ON (Keypress beep)
+const int16_t snd_lock[]    = {30, 0};                    // 60ms ON (Lock confirmation)
+const int16_t snd_success[] = {40, -25, 40, -25, 100, 0}; // 80ms ON, 50ms OFF, 80ms ON, 50ms OFF, 200ms ON
+const int16_t snd_error[]   = {50, -50, 50, -50, 50, 0};  // 3x rapid 100ms beeps with 100ms gaps
+const int16_t snd_siren[]   = {50, -50, 0};               // 100ms ON, 100ms OFF (Looped continuously for alarm)
+
+volatile const int16_t *active_sound = 0; // Pointer to currently playing melody array
+volatile uint8_t sound_idx = 0;           // Current step index in the melody array
+volatile uint16_t sound_timer = 0;        // Remaining 2ms ticks for current note/rest
+
+// Starts playing a non-blocking audio sequence
+void play_sound(const int16_t *seq) {
+    active_sound = seq;
+    sound_idx = 0;
+    if (seq[0] > 0) {
+        // Multi-Function Shield buzzer is 5V Active-Low (PNP transistor).
+        // Setting PTA1 as Output LOW sinks current to turn Buzzer ON.
+        PTA->PDDR |= (1 << 1);
+        sound_timer = seq[0];
+    } else {
+        // Setting PTA1 as Input (High-Impedance) disconnects 3.3V MCU pin from 5V rail
+        // so the PNP transistor fully cuts off and Buzzer turns completely OFF.
+        PTA->PDDR &= ~(1 << 1);
+        sound_timer = -seq[0];
+    }
+}
+
+// =========================================================================
+// 6. BASIC GPIO INITIALIZATION MODULE
+// =========================================================================
+void init_gpio(void) {
+    // Enable clock gating to Port A, Port B, and Port C via SIM->SCGC5
+    SIM->SCGC5 |= SIM_SCGC5_PORTA_MASK | SIM_SCGC5_PORTB_MASK | SIM_SCGC5_PORTC_MASK;
+
+    // 7-Segment 74HC595 Shift Register Control Pins (MUX = 1 -> GPIO Mode)
+    PORTB->PCR[23] = PORT_PCR_MUX(1); // PTB23 (Arduino D4) -> LATCH (ST_CP)
+    PORTC->PCR[3]  = PORT_PCR_MUX(1); // PTC3  (Arduino D7) -> CLOCK (SH_CP)
+    PORTC->PCR[12] = PORT_PCR_MUX(1); // PTC12 (Arduino D8) -> DATA  (DS)
+
+    // Configure shift register control pins as Digital Outputs (PDDR bit = 1)
+    PTB->PDDR |= (1 << 23);
+    PTC->PDDR |= (1 << 3);
+    PTC->PDDR |= (1 << 12);
+
+    // Buzzer Pin: PTA1 (Arduino D3)
+    PORTA->PCR[1] = PORT_PCR_MUX(1); // GPIO Mode
+    PTA->PCOR = (1 << 1);            // Pre-load output register to LOW (0V)
+    PTA->PDDR &= ~(1 << 1);          // Start as Input (High-Z) so Buzzer is OFF at boot
+}
+
+// =========================================================================
+// 7. EXTERNAL INTERRUPT INITIALIZATION MODULE (BUTTONS & MC-38 SENSOR)
+// =========================================================================
+void init_interrupts(void) {
+    // Keypad Buttons: S1 (PTB3), S2 (PTB10), S3 (PTB11) - Active-Low switches
+    // - MUX(1)     : GPIO function
+    // - PE_MASK    : Pull Resistor Enable
+    // - PS_MASK    : Pull-Up Select (idles at 3.3V HIGH; drops to 0V LOW when pressed)
+    // - IRQC(0x0A) : Interrupt on Falling Edge (HIGH -> LOW transition on button press)
+    uint32_t pcr_btn = PORT_PCR_MUX(1) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK | PORT_PCR_IRQC(0x0A);
+    PORTB->PCR[3]  = pcr_btn;
+    PORTB->PCR[10] = pcr_btn;
+    PORTB->PCR[11] = pcr_btn;
+    PTB->PDDR &= ~((1 << 3) | (1 << 10) | (1 << 11)); // Configure as Inputs (PDDR bit = 0)
+    NVIC_EnableIRQ(PORTB_IRQn);                       // Enable Port B interrupt in ARM NVIC
+
+    // Magnetic Door Sensor MC-38: PTC2 (Arduino D6)
+    // - Normally Closed (NC) reed switch connected between PTC2 and GND
+    // - Magnet together (Door Closed) -> Circuit closed to GND -> Logic LOW (0)
+    // - Magnet separated (Door Open)  -> Internal Pull-Up pulls pin -> Logic HIGH (1)
+    // - IRQC(0x0B) : Interrupt on EITHER Edge (both Rising & Falling) to detect open AND close
+    uint32_t pcr_sensor = PORT_PCR_MUX(1) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK | PORT_PCR_IRQC(0x0B);
+    PORTC->PCR[2] = pcr_sensor;
+    PTC->PDDR &= ~(1 << 2);     // Configure PTC2 as Input
+    NVIC_EnableIRQ(PORTC_IRQn); // Enable Port C interrupt in ARM NVIC
+}
+
+// =========================================================================
+// 8. SERVO MOTOR MODULE (FTM0 CHANNEL 7 HARDWARE PWM)
+// =========================================================================
+void servo_lock(void) {
+    FTM0->CONTROLS[7].CnV = SERVO_LOCK;   // Set Duty Cycle to 164 (~1.0ms / 0 deg)
+}
+
+void servo_unlock(void) {
+    FTM0->CONTROLS[7].CnV = SERVO_UNLOCK; // Set Duty Cycle to 328 (~2.0ms / 180 deg)
+}
+
+void init_pwm_servo(void) {
+    SIM->SCGC6 |= SIM_SCGC6_FTM0_MASK; // Enable clock gating to FlexTimer 0 (FTM0)
+    PORTA->PCR[2] = PORT_PCR_MUX(3);   // PTA2 (Arduino D5), Alt 3 = FTM0_CH7 output
+
+    FTM0->MODE |= FTM_MODE_WPDIS_MASK; // Disable Write Protection to allow register edits
+    FTM0->SC = 0x00;                   // Stop FTM0 counter during configuration
+
+    // Set counter overflow limit for 50 Hz (20 ms period):
+    // 20,971,520 Hz / 128 (Prescaler) / 50 Hz = 3276.8 -> 3276
+    FTM0->MOD = FTM_SERVO_MOD;
+
+    // Configure Channel 7 for Edge-Aligned PWM (High-true pulses):
+    // MSB=1, ELSB=1 -> Output is HIGH from 0 to CnV, then LOW from CnV to MOD
+    FTM0->CONTROLS[7].CnSC = FTM_CnSC_MSB_MASK | FTM_CnSC_ELSB_MASK;
+    servo_lock(); // Initialize safe bolt to locked position (0 deg)
+
+    // Start FTM0:
+    // - CLKS(1) : Select System Clock (20.97152 MHz)
+    // - PS(7)   : Prescaler divide-by-128 (2^7 = 128)
+    FTM0->SC = FTM_SC_CLKS(1) | FTM_SC_PS(7);
+}
+
+// =========================================================================
+// 9. SYSTICK TIMER INITIALIZATION MODULE (2ms SYSTEM HEARTBEAT)
+// =========================================================================
+void init_systick(void) {
+    // SysTick is a 24-bit down-counter (max reload value = 2^24 - 1 = 16,777,215).
+    // Target interrupt interval = 2 ms (500 Hz) for flicker-free display multiplexing.
+    // Core Clock = 20,971,520 Hz
+    // Formula: LOAD = (Core_Clock * Time_in_Seconds) - 1
+    //        = (20,971,520 * 0.002) - 1 = 41,943.04 - 1 = 41,942 (within 24-bit limit)
+    SysTick->LOAD = 41942;
+    SysTick->VAL  = 0; // Reset current counter value to 0
+
+    // Enable SysTick Control Register:
+    // - CLKSOURCE_Msk : Use Processor Core Clock (20.97 MHz)
+    // - TICKINT_Msk   : Trigger SysTick_Handler() interrupt when counter reaches 0
+    // - ENABLE_Msk    : Start counting immediately
+    SysTick->CTRL = SysTick_CTRL_CLKSOURCE_Msk | SysTick_CTRL_TICKINT_Msk | SysTick_CTRL_ENABLE_Msk;
+}
+
+// =========================================================================
+// 10. 7-SEGMENT DISPLAY MODULE
+// =========================================================================
+// Bit-banging serial transmission (MSB First) to 74HC595 Shift Register
+void shiftOut_ARM(uint8_t data) {
+    for (int i = 0; i < 8; i++) {
+        // Output bit (7 - i) to DATA pin (PTC12)
+        if (data & (1 << (7 - i))) PTC->PSOR = (1 << 12); // Set HIGH
+        else                       PTC->PCOR = (1 << 12); // Set LOW
+
+        // Generate rising-edge clock pulse on CLK pin (PTC3) to shift bit in
+        PTC->PSOR = (1 << 3);
+        PTC->PCOR = (1 << 3);
+    }
+}
+
+void set_display_lock(void) {
+    display_buffer[0] = SEG_L; display_buffer[1] = SEG_O;
+    display_buffer[2] = SEG_C; display_buffer[3] = SEG_OFF; // "LOC "
+}
+
+void set_display_open(void) {
+    display_buffer[0] = SEG_O; display_buffer[1] = SEG_P;
+    display_buffer[2] = SEG_E; display_buffer[3] = SEG_n;   // "OPEn"
+}
+
+void set_display_alarm(void) {
+    display_buffer[0] = SEG_A; display_buffer[1] = SEG_L;
+    display_buffer[2] = SEG_r; display_buffer[3] = SEG_OFF; // "ALr "
+}
+
+void trigger_error(void) {
+    input_count = 0; // Reset partial password input
+    display_buffer[0] = SEG_E; display_buffer[1] = SEG_r;
+    display_buffer[2] = SEG_r; display_buffer[3] = SEG_OFF; // "Err "
+
+    // Play 3-beep error sound unless intrusion siren is already taking priority
+    if (alarm_triggered == 0) play_sound(snd_error);
+
+    // Start 3-second lockout penalty (1500 ticks * 2ms = 3000ms)
+    error_timer = PENALTY_TICKS;
+}
+
+// =========================================================================
+// 11. SYSTICK INTERRUPT HANDLER (EXECUTES AUTOMATICALLY EVERY 2 ms)
+// =========================================================================
+void SysTick_Handler(void) {
+    // --- TASK A: 7-Segment Display Multiplexing ---
+    // Refreshes 1 digit every 2 ms -> Full 4-digit scan takes 8 ms (125 Hz refresh rate)
+    PTB->PCOR = (1 << 23);                       // LATCH LOW (Hold previous display)
+    shiftOut_ARM(display_buffer[current_digit]); // Shift 8-bit segment pattern
+    shiftOut_ARM(DIGIT_SELECT[current_digit]);   // Shift 8-bit digit select mask
+    PTB->PSOR = (1 << 23);                       // LATCH HIGH (Update physical LEDs)
+    current_digit = (current_digit + 1) % 4;     // Advance to next digit (0->1->2->3->0)
+
+    // --- TASK B: Non-Blocking Audio Sequencer ---
+    if (active_sound != 0) {
+        if (sound_timer > 0) {
+            sound_timer--; // Count down current tone/silence duration
+        } else {
+            sound_idx++; // Move to next element in melody array
+            if (active_sound[sound_idx] == 0) {
+                active_sound = 0;       // End of sequence reached
+                PTA->PDDR &= ~(1 << 1); // Ensure Buzzer is OFF (Input/High-Z)
+            } else if (active_sound[sound_idx] > 0) {
+                PTA->PDDR |= (1 << 1);  // Buzzer ON (Output LOW)
+                sound_timer = active_sound[sound_idx];
+            } else {
+                PTA->PDDR &= ~(1 << 1); // Buzzer OFF (Rest/Silence)
+                sound_timer = -active_sound[sound_idx];
+            }
+        }
+    }
+
+    // --- TASK C: Wrong Password Lockout Timer (3 seconds) ---
+    if (error_timer > 0) {
+        error_timer--;
+        if (error_timer == 0 && safe_unlocked == 0) {
+            // Restore appropriate display once 3s penalty expires
+            if (alarm_triggered == 1) set_display_alarm();
+            else                      set_display_lock();
+        }
+    }
+
+    // --- TASK D: Auto-Lock Countdown Timer (3 seconds after door closes) ---
+    if (auto_lock_timer > 0) {
+        auto_lock_timer--;
+        if (auto_lock_timer == 0 && safe_unlocked == 1) {
+            safe_unlocked = 0;
+            input_count = 0;
+            set_display_lock();
+            servo_lock();         // Rotate servo back to 0 deg
+            play_sound(snd_lock);
+        }
+    }
+
+    // --- TASK E: Continuous Intrusion Alarm Siren Loop ---
+    if (alarm_triggered == 1 && active_sound == 0) {
+        play_sound(snd_siren); // Restart siren whenever previous loop finishes
+    }
+
+    // --- TASK F: Switch Debounce Timer (200 ms) ---
+    if (debounce_timer > 0) debounce_timer--;
+}
+
+// =========================================================================
+// 12. PASSWORD & KEYPAD STATE MACHINE MODULE
+// =========================================================================
+void handle_keypress(uint8_t key_id) {
+    if (safe_unlocked == 1) {
+        // Manual Lock via S1 when safe is currently unlocked
+        if (key_id == 1) {
+            // Safety Check: Read PTC2 (MC-38). Logic HIGH means door is still open.
+            if (PTC->PDIR & (1 << 2)) {
+                play_sound(snd_error); // Refuse to lock while door is open
+            } else {
+                safe_unlocked = 0;
+                input_count = 0;
+                set_display_lock();
+                servo_lock();          // Lock bolt (0 deg)
+                play_sound(snd_lock);
+            }
+        }
+    } else {
+        // Store entered digit into buffer (Side-channel resistant: evaluates only at 4th digit)
+        input_buffer[input_count] = key_id;
+        input_count++;
+        play_sound(snd_key);
+
+        // Shift Display Logic: Clear on 1st digit, shift left on digits 2..4
+        if (input_count == 1) {
+            display_buffer[0] = SEG_OFF; display_buffer[1] = SEG_OFF; display_buffer[2] = SEG_OFF;
+        } else {
+            display_buffer[0] = display_buffer[1];
+            display_buffer[1] = display_buffer[2];
+            display_buffer[2] = display_buffer[3];
+        }
+
+        // Put newly pressed digit on rightmost position (Digit 3)
+        if (key_id == 1)      display_buffer[3] = SEG_1;
+        else if (key_id == 2) display_buffer[3] = SEG_2;
+        else if (key_id == 3) display_buffer[3] = SEG_3;
+
+        // Evaluate full 4-digit passcode once 4 keys are pressed
+        if (input_count >= 4) {
+            uint8_t is_match = 1;
+            for (int i = 0; i < 4; i++) {
+                if (input_buffer[i] != correct_password[i]) is_match = 0;
+            }
+
+            if (is_match == 1) {
+                safe_unlocked = 1;
+                alarm_triggered = 0; // Disarm intrusion alarm if active
+                input_count = 0;
+                auto_lock_timer = 0;
+                set_display_open();
+                servo_unlock();      // Unlock bolt (180 deg)
+                play_sound(snd_success);
+            } else {
+                trigger_error();     // Show "Err " and lock keypad for 3 seconds
+            }
+        }
+    }
+}
+
+// =========================================================================
+// 13. EXTERNAL INTERRUPT SERVICE ROUTINES (ISRs)
+// =========================================================================
+// Port B ISR: Triggered on Falling Edge of Buttons S1, S2, or S3
+void PORTB_IRQHandler(void) {
+    // Ignore button noise during 200ms debounce window or 3s error penalty
+    if (debounce_timer > 0 || error_timer > 0) {
+        PORTB->ISFR = 0xFFFFFFFF; // Write-1-to-clear all Port B interrupt flags
+        return;
+    }
+
+    // Check individual pin Interrupt Status Flag Register (ISFR), clear flag, start debounce
+    if (PORTB->ISFR & (1 << 3))  { PORTB->ISFR = (1 << 3);  debounce_timer = DEBOUNCE_TICKS; handle_keypress(1); } // S1
+    if (PORTB->ISFR & (1 << 10)) { PORTB->ISFR = (1 << 10); debounce_timer = DEBOUNCE_TICKS; handle_keypress(2); } // S2
+    if (PORTB->ISFR & (1 << 11)) { PORTB->ISFR = (1 << 11); debounce_timer = DEBOUNCE_TICKS; handle_keypress(3); } // S3
+}
+
+// Port C ISR: Triggered on Either Edge of MC-38 Magnetic Door Sensor (PTC2)
+void PORTC_IRQHandler(void) {
+    if (PORTC->ISFR & (1 << 2)) {
+        PORTC->ISFR = (1 << 2); // Clear PTC2 interrupt flag (Write-1-to-clear)
+
+        if (PTC->PDIR & (1 << 2)) {
+            // Rising Edge (Logic HIGH) -> Magnet separated -> DOOR OPENED
+            if (safe_unlocked == 0) {
+                alarm_triggered = 1; // Forced entry detected while locked!
+                set_display_alarm();
+            }
+            auto_lock_timer = 0;     // Cancel auto-lock if door is reopened
+        } else {
+            // Falling Edge (Logic LOW) -> Magnet together -> DOOR CLOSED
+            if (safe_unlocked == 1 && alarm_triggered == 0) {
+                auto_lock_timer = AUTOLOCK_TICKS; // Begin 3-second auto-lock countdown
+            }
+        }
+    }
+}
+
+// =========================================================================
+// 14. MAIN FUNCTION (100% EVENT-DRIVEN, NON-BLOCKING ARCHITECTURE)
+// =========================================================================
+int main(void) {
+    init_gpio();       // Setup 7-Segment shift register pins & Buzzer
+    init_pwm_servo();  // Setup FTM0_CH7 50Hz Hardware PWM & lock bolt
+    init_interrupts(); // Setup External Interrupts for S1-S3 & MC-38
+    init_systick();    // Start 2ms SysTick heartbeat timer
+
+    while (1) {
+        // CPU remains idle here (no delay() or polling loops).
+        // All operations are driven by SysTick_Handler, PORTB_IRQHandler, and PORTC_IRQHandler.
+    }
+}
